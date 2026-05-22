@@ -41,32 +41,26 @@ def resize_if_large(img: np.ndarray) -> np.ndarray:
     return img
 
 
-def apply_gamma(gray: np.ndarray, gamma: float) -> np.ndarray:
-    inv_gamma = 1.0 / gamma
-    table = np.array([((i / 255.0) ** inv_gamma) * 255
-                      for i in range(256)], dtype=np.uint8)
-    return cv2.LUT(gray, table)
+def direct_threshold(gray: np.ndarray, value: int) -> np.ndarray:
+    """
+    Your working method from notebook:
+    Direct black/white conversion at fixed threshold.
+    No blur, no neighbour mimicking — just hard cut.
+    Pixels > value → WHITE (255)
+    Pixels <= value → BLACK (0)
+    """
+    return np.where(gray > value, 255, 0).astype(np.uint8)
 
 
-def deskew(gray: np.ndarray) -> np.ndarray:
-    try:
-        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-        lines = cv2.HoughLines(edges, 1, np.pi / 180, 100)
-        if lines is None:
-            return gray
-        angles = [((l[0][1] * 180 / np.pi) - 90)
-                  for l in lines[:20]
-                  if -45 < (l[0][1] * 180 / np.pi) - 90 < 45]
-        if not angles or abs(float(np.median(angles))) < 0.5:
-            return gray
-        h, w = gray.shape
-        M = cv2.getRotationMatrix2D((w // 2, h // 2),
-                                    float(np.median(angles)), 1.0)
-        return cv2.warpAffine(gray, M, (w, h),
-                              flags=cv2.INTER_CUBIC,
-                              borderMode=cv2.BORDER_REPLICATE)
-    except Exception:
-        return gray
+def morph_open_cleanup(binary: np.ndarray,
+                       ksize: tuple = (2, 2)) -> np.ndarray:
+    """
+    Your working method from notebook:
+    Morphological open with (2,2) kernel.
+    Removes tiny noise blobs without affecting bar structure.
+    """
+    kernel = np.ones(ksize, np.uint8)
+    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
 
 # ════════════════════════════════════════════════════════
@@ -74,11 +68,11 @@ def deskew(gray: np.ndarray) -> np.ndarray:
 # ════════════════════════════════════════════════════════
 
 def try_opencv(img: np.ndarray) -> dict | None:
-    """OpenCV ML-based barcode detector."""
     if not CV2_AVAILABLE:
         return None
     try:
-        ret, decoded_list, decoded_types, _ = cv2_detector.detectAndDecodeMulti(img)
+        ret, decoded_list, decoded_types, _ = \
+            cv2_detector.detectAndDecodeMulti(img)
         if ret and decoded_list:
             for i, val in enumerate(decoded_list):
                 if val and val.strip():
@@ -90,272 +84,207 @@ def try_opencv(img: np.ndarray) -> dict | None:
 
 
 def try_zxing(img: np.ndarray) -> dict | None:
-    """zxing-cpp decoder."""
     try:
-        pil = Image.fromarray(img if len(img.shape) == 2
-                              else cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        pil = Image.fromarray(
+            img if len(img.shape) == 2
+            else cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        )
         results = zxingcpp.read_barcodes(pil)
         if results:
-            return {"value": results[0].text, "format": str(results[0].format)}
+            return {"value": results[0].text,
+                    "format": str(results[0].format)}
     except Exception:
         pass
     return None
 
 
-def try_decoders(img: np.ndarray, variant: str, phase: str) -> dict | None:
-    """Try both decoders on one image. Return full result dict or None."""
-    for decoder_fn, decoder_name in [
-        (try_opencv, "opencv_barcode_detector"),
-        (try_zxing,  "zxing_cpp")
-    ]:
-        result = decoder_fn(img)
-        if result:
+def try_decoders(img: np.ndarray,
+                 variant: str, phase: str) -> dict | None:
+    """Try OpenCV then zxing-cpp on one image variant."""
+    for fn, name in [(try_opencv, "opencv_barcode_detector"),
+                     (try_zxing,  "zxing_cpp")]:
+        r = fn(img)
+        if r:
             return {
                 "isReadable":     True,
-                "barcodeValue":   result["value"],
-                "barcodeFormat":  result["format"],
+                "barcodeValue":   r["value"],
+                "barcodeFormat":  r["format"],
                 "successVariant": variant,
-                "decoder":        decoder_name,
+                "decoder":        name,
                 "phase":          phase,
             }
     return None
 
 
 # ════════════════════════════════════════════════════════
-# PHASE 1 — CONTRAST NORMALISATION
-# Make dark colours → black, light colours → white
-# This is the primary fix for coloured backgrounds
+# PHASE 1 — YOUR NOTEBOOK METHOD (direct threshold)
+# This is the method confirmed to work on your barcodes.
+# Tries multiple threshold values + noise cleanup variants.
 # ════════════════════════════════════════════════════════
 
-def phase1_contrast_variants(img: np.ndarray, gray: np.ndarray,
-                              clahe) -> list:
+def phase1_direct_threshold(img: np.ndarray,
+                             gray: np.ndarray) -> list:
     """
-    Variants that push dark → black, light → white.
-    Designed to normalise coloured backgrounds before decoding.
+    Based exactly on your working notebook:
+    gray → direct threshold at N → morph_open cleanup
+
+    Tries threshold values from 80 to 200 in steps.
+    Lower value  → more pixels become WHITE
+    Higher value → more pixels become BLACK
+
+    Your notebook used 120 — we sweep around it.
     """
     variants = []
 
-    # Raw grayscale (baseline — dark already dark, light already light)
-    variants.append(("p1_grayscale",    gray))
-
-    # CLAHE — adaptive contrast, pulls dark bars darker, light bg lighter
-    clahe_img = clahe.apply(gray)
-    variants.append(("p1_clahe",        clahe_img))
-
-    # Otsu — finds optimal global threshold, black/white split
-    _, otsu = cv2.threshold(gray, 0, 255,
-                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("p1_otsu",         otsu))
-
-    # CLAHE + Otsu — best combo for coloured backgrounds
-    _, clahe_otsu = cv2.threshold(clahe_img, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("p1_clahe_otsu",   clahe_otsu))
-
-    # Adaptive threshold — handles uneven lighting across label
-    adaptive = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2)
-    variants.append(("p1_adaptive",     adaptive))
-
-    # CLAHE + Adaptive
-    clahe_adaptive = cv2.adaptiveThreshold(
-        clahe_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2)
-    variants.append(("p1_clahe_adaptive", clahe_adaptive))
-
-    # Gamma brighten (1.5, 2.0) → makes dark bg lighter, improves contrast
-    for gval in [1.5, 2.0]:
-        g = apply_gamma(gray, gval)
-        g_clahe = clahe.apply(g)
-        _, g_otsu = cv2.threshold(g_clahe, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append((f"p1_gamma_{gval}_clahe_otsu", g_otsu))
-
-    # Gamma darken (0.7) → makes light bg darker for high-key images
-    g_dark = apply_gamma(gray, 0.7)
-    _, g_dark_otsu = cv2.threshold(g_dark, 0, 255,
-                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("p1_gamma_0.7_otsu", g_dark_otsu))
-
-    # Bilateral + CLAHE + Otsu — smooth noise while keeping bar edges
-    bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
-    bil_clahe  = clahe.apply(bilateral)
-    _, bil_otsu = cv2.threshold(bil_clahe, 0, 255,
-                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("p1_bilateral_clahe_otsu", bil_otsu))
-
-    # Original color image (OpenCV detector works well on color)
+    # ── Raw first (no threshold) ──
     variants.append(("p1_original_color", img))
+    variants.append(("p1_grayscale",      gray))
+
+    # ── Your exact notebook method: threshold=120 + cleanup ──
+    t120        = direct_threshold(gray, 120)
+    t120_clean  = morph_open_cleanup(t120)
+    variants.append(("p1_threshold_120",             t120))
+    variants.append(("p1_threshold_120_cleaned",     t120_clean))
+
+    # ── Sweep threshold values around 120 ──
+    # Covers different background brightness levels
+    for tval in [80, 90, 100, 110, 130, 140, 150, 160, 180, 200]:
+        binary      = direct_threshold(gray, tval)
+        cleaned     = morph_open_cleanup(binary)
+        variants.append((f"p1_threshold_{tval}",         binary))
+        variants.append((f"p1_threshold_{tval}_cleaned", cleaned))
+
+    # ── Different kernel sizes for cleanup ──
+    for ksize in [(3, 3), (2, 1), (1, 2)]:
+        t120_k = morph_open_cleanup(t120, ksize)
+        variants.append((f"p1_threshold_120_morph_{ksize[0]}x{ksize[1]}",
+                         t120_k))
 
     return variants
 
 
 # ════════════════════════════════════════════════════════
-# PHASE 2 — DEEP PREPROCESSING
-# More aggressive techniques for difficult cases
+# PHASE 2 — INVERTED NOTEBOOK METHOD
+# Same method but invert first (for reversed barcodes)
+# Light bars on dark background
 # ════════════════════════════════════════════════════════
 
-def phase2_preprocessing_variants(img: np.ndarray, gray: np.ndarray,
-                                   clahe) -> list:
+def phase2_inverted_threshold(gray: np.ndarray) -> list:
     """
-    Advanced preprocessing for barcodes that Phase 1 couldn't read.
-    """
-    variants = []
-    clahe_img = clahe.apply(gray)
-    _, otsu = cv2.threshold(gray, 0, 255,
-                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, clahe_otsu = cv2.threshold(clahe_img, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kh = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
-    kc = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
-    ko = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
-
-    # Morphological erode — thins bleeding/overburnt bars
-    eroded = cv2.erode(otsu, kh, iterations=1)
-    variants.append(("p2_morph_erode",           eroded))
-
-    # CLAHE + Otsu + Erode — best for overburnt coloured labels
-    clahe_eroded = cv2.erode(clahe_otsu, kh, iterations=1)
-    variants.append(("p2_clahe_otsu_erode",      clahe_eroded))
-
-    # Morphological close — connects broken bars
-    closed = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kc)
-    variants.append(("p2_morph_close",           closed))
-
-    # Morphological open — removes noise blobs between bars
-    opened = cv2.morphologyEx(otsu, cv2.MORPH_OPEN, ko)
-    variants.append(("p2_morph_open",            opened))
-
-    # Sharpening — recovers soft bar edges
-    k_sharp = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharpened = cv2.filter2D(gray, -1, k_sharp)
-    _, sharp_otsu = cv2.threshold(sharpened, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("p2_sharpened_otsu",        sharp_otsu))
-
-    # Aggressive sharpen
-    k_sharp2 = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
-    sharp2 = cv2.filter2D(gray, -1, k_sharp2)
-    _, sharp2_otsu = cv2.threshold(sharp2, 0, 255,
-                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("p2_aggressive_sharp_otsu", sharp2_otsu))
-
-    # Deskew + CLAHE + Otsu — fixes tilted barcode photos
-    deskewed = deskew(gray)
-    desk_clahe = clahe.apply(deskewed)
-    _, desk_otsu = cv2.threshold(desk_clahe, 0, 255,
-                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("p2_deskewed_clahe_otsu",   desk_otsu))
-
-    # Upscale small images
-    h, w = gray.shape[:2]
-    if w < 800:
-        up = cv2.resize(gray, (int(w * 2), int(h * 2)),
-                        interpolation=cv2.INTER_CUBIC)
-        up_clahe = clahe.apply(up)
-        _, up_otsu = cv2.threshold(up_clahe, 0, 255,
-                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append(("p2_upscaled_clahe_otsu", up_otsu))
-
-    # Denoise + Otsu (expensive — last in phase 2)
-    denoised = cv2.fastNlMeansDenoising(gray, h=10)
-    den_clahe = clahe.apply(denoised)
-    _, den_otsu = cv2.threshold(den_clahe, 0, 255,
-                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("p2_denoised_clahe_otsu",   den_otsu))
-
-    # Denoise + Erode
-    den_eroded = cv2.erode(den_otsu, kh, iterations=1)
-    variants.append(("p2_denoised_eroded",       den_eroded))
-
-    return variants
-
-
-# ════════════════════════════════════════════════════════
-# PHASE 3 — INVERTED
-# Swap: light → black, dark → white
-# For white-bars-on-dark or reversed laser prints
-# ════════════════════════════════════════════════════════
-
-def phase3_inverted_variants(img: np.ndarray, gray: np.ndarray,
-                              clahe) -> list:
-    """
-    Invert all Phase 1 + Phase 2 variants.
+    Invert the grayscale first, then apply same threshold method.
     Handles barcodes where bars are lighter than background.
     """
     variants = []
-    clahe_img  = clahe.apply(gray)
-    _, otsu    = cv2.threshold(gray, 0, 255,
-                               cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, clahe_otsu = cv2.threshold(clahe_img, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kh = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+    inv_gray = cv2.bitwise_not(gray)
 
-    adaptive = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2)
+    # ── Inverted + your exact threshold ──
+    t120       = direct_threshold(inv_gray, 120)
+    t120_clean = morph_open_cleanup(t120)
+    variants.append(("p2_inv_threshold_120",         t120))
+    variants.append(("p2_inv_threshold_120_cleaned", t120_clean))
 
-    bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
-    bil_clahe  = clahe.apply(bilateral)
-    _, bil_otsu = cv2.threshold(bil_clahe, 0, 255,
-                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # ── Sweep threshold on inverted image ──
+    for tval in [80, 90, 100, 110, 130, 140, 150, 160, 180, 200]:
+        binary  = direct_threshold(inv_gray, tval)
+        cleaned = morph_open_cleanup(binary)
+        variants.append((f"p2_inv_threshold_{tval}",         binary))
+        variants.append((f"p2_inv_threshold_{tval}_cleaned", cleaned))
 
-    # Inverted versions of all key Phase 1 variants
-    variants.append(("p3_inv_gray",              cv2.bitwise_not(gray)))
-    variants.append(("p3_inv_clahe",             cv2.bitwise_not(clahe_img)))
-    variants.append(("p3_inv_otsu",              cv2.bitwise_not(otsu)))
-    variants.append(("p3_inv_clahe_otsu",        cv2.bitwise_not(clahe_otsu)))
-    variants.append(("p3_inv_adaptive",          cv2.bitwise_not(adaptive)))
-    variants.append(("p3_inv_bilateral_otsu",    cv2.bitwise_not(bil_otsu)))
-
-    # Inverted gamma
-    for gval in [1.5, 2.0, 0.7]:
-        g = apply_gamma(gray, gval)
-        g_clahe = clahe.apply(g)
-        _, g_otsu = cv2.threshold(g_clahe, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append((f"p3_inv_gamma_{gval}_clahe_otsu",
-                         cv2.bitwise_not(g_otsu)))
-
-    # Inverted morphological
-    eroded = cv2.erode(otsu, kh, iterations=1)
-    variants.append(("p3_inv_erode",             cv2.bitwise_not(eroded)))
-    clahe_eroded = cv2.erode(clahe_otsu, kh, iterations=1)
-    variants.append(("p3_inv_clahe_otsu_erode",  cv2.bitwise_not(clahe_eroded)))
-
-    # Inverted denoise
-    denoised = cv2.fastNlMeansDenoising(gray, h=10)
-    _, den_otsu = cv2.threshold(denoised, 0, 255,
-                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("p3_inv_denoised_otsu",     cv2.bitwise_not(den_otsu)))
-
-    # Inverted original color
-    variants.append(("p3_inv_color",             cv2.bitwise_not(img)))
+    # ── Also try: threshold first, then invert result ──
+    # Different from inverting gray first
+    t120_then_inv = cv2.bitwise_not(direct_threshold(gray, 120))
+    variants.append(("p2_threshold_120_then_inv",    t120_then_inv))
+    t120_clean_inv = cv2.bitwise_not(morph_open_cleanup(
+                        direct_threshold(gray, 120)))
+    variants.append(("p2_threshold_120_clean_then_inv", t120_clean_inv))
 
     return variants
 
 
 # ════════════════════════════════════════════════════════
-# MAIN SCAN FUNCTION
+# PHASE 3 — ENHANCED CONTRAST THEN NOTEBOOK METHOD
+# Apply contrast enhancement before your threshold method
+# For very dark or very washed-out colored backgrounds
+# ════════════════════════════════════════════════════════
+
+def phase3_contrast_then_threshold(img: np.ndarray,
+                                    gray: np.ndarray) -> list:
+    """
+    Improve contrast first, then apply your direct threshold method.
+    Covers cases where background color is too close to bar color.
+    """
+    variants = []
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    # ── CLAHE then direct threshold ──
+    clahe_gray = clahe.apply(gray)
+    for tval in [100, 110, 120, 130, 140]:
+        binary  = direct_threshold(clahe_gray, tval)
+        cleaned = morph_open_cleanup(binary)
+        variants.append((f"p3_clahe_threshold_{tval}",         binary))
+        variants.append((f"p3_clahe_threshold_{tval}_cleaned", cleaned))
+
+    # ── CLAHE inverted then direct threshold ──
+    clahe_inv = cv2.bitwise_not(clahe_gray)
+    for tval in [100, 120, 140]:
+        binary  = direct_threshold(clahe_inv, tval)
+        cleaned = morph_open_cleanup(binary)
+        variants.append((f"p3_clahe_inv_threshold_{tval}",         binary))
+        variants.append((f"p3_clahe_inv_threshold_{tval}_cleaned", cleaned))
+
+    # ── Gamma brighten then threshold ──
+    # Helps when background is too dark
+    for gamma in [1.5, 2.0]:
+        table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255
+                          for i in range(256)], dtype=np.uint8)
+        g_img = cv2.LUT(gray, table)
+        for tval in [110, 120, 130]:
+            binary  = direct_threshold(g_img, tval)
+            cleaned = morph_open_cleanup(binary)
+            variants.append((f"p3_gamma{gamma}_threshold_{tval}_cleaned",
+                             cleaned))
+
+    # ── Bilateral filter then threshold ──
+    # Smooths noise while keeping bar edges sharp
+    bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
+    for tval in [110, 120, 130]:
+        binary  = direct_threshold(bilateral, tval)
+        cleaned = morph_open_cleanup(binary)
+        variants.append((f"p3_bilateral_threshold_{tval}_cleaned", cleaned))
+
+    # ── Bilateral inverted then threshold ──
+    bil_inv = cv2.bitwise_not(bilateral)
+    t120    = direct_threshold(bil_inv, 120)
+    cleaned = morph_open_cleanup(t120)
+    variants.append(("p3_bilateral_inv_threshold_120_cleaned", cleaned))
+
+    return variants
+
+
+# ════════════════════════════════════════════════════════
+# MAIN SCAN
 # ════════════════════════════════════════════════════════
 
 def preprocess_and_scan(img: np.ndarray) -> dict:
     """
-    3-phase scanning:
-    Phase 1 → Contrast normalisation (dark→black, light→white)
-    Phase 2 → Deep preprocessing (morphology, sharpen, denoise)
-    Phase 3 → Inverted (light→black, dark→white)
-    Each variant tried with OpenCV decoder then zxing-cpp.
+    3-phase pipeline based on your working notebook method.
+
+    Phase 1: Direct threshold (your exact method) — normal + sweep
+    Phase 2: Inverted then direct threshold — for reversed barcodes
+    Phase 3: Contrast enhancement then direct threshold — tough backgrounds
     """
     img  = resize_if_large(img)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     phases = [
-        ("Phase 1 - Contrast Normalisation", phase1_contrast_variants(img, gray, clahe)),
-        ("Phase 2 - Deep Preprocessing",     phase2_preprocessing_variants(img, gray, clahe)),
-        ("Phase 3 - Inverted",               phase3_inverted_variants(img, gray, clahe)),
+        ("Phase 1 - Direct Threshold (Your Method)",
+         phase1_direct_threshold(img, gray)),
+
+        ("Phase 2 - Inverted + Direct Threshold",
+         phase2_inverted_threshold(gray)),
+
+        ("Phase 3 - Contrast Enhanced + Direct Threshold",
+         phase3_contrast_then_threshold(img, gray)),
     ]
 
     total_variants = sum(len(v) for _, v in phases)
@@ -380,7 +309,7 @@ def preprocess_and_scan(img: np.ndarray) -> dict:
         "phase":          None,
         "variantsTried":  variants_tried,
         "totalVariants":  total_variants,
-        "error":          f"Not readable after all {total_variants} variants across 3 phases"
+        "error":          f"Not readable after {total_variants} variants"
     }
 
 
@@ -390,10 +319,6 @@ def preprocess_and_scan(img: np.ndarray) -> dict:
 
 @app.route('/scan', methods=['POST', 'OPTIONS'])
 def scan_barcode():
-    """
-    POST /scan
-    Body: { "image": "<base64 with or without data URI prefix>" }
-    """
     if request.method == 'OPTIONS':
         return '', 204
     try:
@@ -432,12 +357,12 @@ def scan_barcode():
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
-        "status":           "ok",
-        "message":          "Barcode API running — 3-phase pipeline",
-        "phases":           [
-            "Phase 1: Contrast Normalisation (dark→black, light→white)",
-            "Phase 2: Deep Preprocessing (morphology, sharpen, denoise)",
-            "Phase 3: Inverted (light→black, dark→white)"
+        "status":  "ok",
+        "message": "Barcode API — notebook method pipeline",
+        "phases": [
+            "Phase 1: Direct threshold sweep (your notebook method)",
+            "Phase 2: Inverted + direct threshold (reversed barcodes)",
+            "Phase 3: Contrast enhanced + direct threshold (tough backgrounds)"
         ],
         "decoders":         ["opencv_barcode_detector", "zxing_cpp"],
         "opencv_available": CV2_AVAILABLE,
