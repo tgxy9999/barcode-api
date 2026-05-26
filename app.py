@@ -18,7 +18,7 @@ try:
 except Exception:
     cv2_detector = None
     CV2_AVAILABLE = False
-    ACTIVE_DECODER = "zxing"  # fallback
+    ACTIVE_DECODER = "zxing"
 
 
 def decode_base64_image(b64_string: str) -> np.ndarray:
@@ -29,8 +29,14 @@ def decode_base64_image(b64_string: str) -> np.ndarray:
     return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
 
+def img_to_base64(img: np.ndarray) -> str:
+    """Convert numpy image array to base64 PNG string for returning to client."""
+    _, buf = cv2.imencode('.png', img)
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode('utf-8')
+
+
 def to_pil(img: np.ndarray) -> Image.Image:
-    """Encode to PNG then reload — simulates save/reload from notebook."""
+    """Encode to PNG then reload — simulates notebook save/reload cycle."""
     _, buf = cv2.imencode('.png', img)
     pil = Image.open(io.BytesIO(buf.tobytes()))
     pil.load()
@@ -40,10 +46,9 @@ def to_pil(img: np.ndarray) -> Image.Image:
 def scan(img: np.ndarray) -> str | None:
     """
     Scan using OpenCV decoder.
-    If OpenCV library failed to load, fall back to zxing-cpp.
+    Falls back to zxing-cpp only if OpenCV library failed to load.
     """
     if CV2_AVAILABLE:
-        # ── Primary: OpenCV BarcodeDetector ──
         try:
             ret, decoded_list, _, _ = cv2_detector.detectAndDecodeMulti(img)
             if ret and decoded_list:
@@ -54,7 +59,6 @@ def scan(img: np.ndarray) -> str | None:
             pass
         return None
     else:
-        # ── Fallback: zxing-cpp (only if OpenCV not available) ──
         try:
             results = zxingcpp.read_barcodes(to_pil(img))
             if results:
@@ -72,90 +76,144 @@ def scan_barcode():
     try:
         data = request.get_json(force=True)
         if not data or 'image' not in data:
-            return jsonify({"isReadable": False, "barcodeValue": None,
-                            "error": "Missing 'image' field"}), 400
+            return jsonify({
+                "isReadable": False, "barcodeValue": None,
+                "processedImage": None,
+                "error": "Missing 'image' field"
+            }), 400
 
         img = decode_base64_image(data['image'])
         if img is None:
-            return jsonify({"isReadable": False, "barcodeValue": None,
-                            "error": "Could not decode image"}), 400
+            return jsonify({
+                "isReadable": False, "barcodeValue": None,
+                "processedImage": None,
+                "error": "Could not decode image"
+            }), 400
 
         # ════════════════════════════════════════
         # STEP 1 — original image
         # ════════════════════════════════════════
         val = scan(img)
         if val:
-            return jsonify({"isReadable": True, "barcodeValue": val,
-                            "variant": "original",
-                            "decoder": ACTIVE_DECODER, "error": None})
+            return jsonify({
+                "isReadable":     True,
+                "barcodeValue":   val,
+                "variant":        "original",
+                "decoder":        ACTIVE_DECODER,
+                "processedImage": img_to_base64(img),
+                "error":          None
+            })
 
         # ════════════════════════════════════════
-        # STEP 2 — grayscale (notebook step 1)
+        # STEP 2 — grayscale
         # ════════════════════════════════════════
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         val = scan(gray)
         if val:
-            return jsonify({"isReadable": True, "barcodeValue": val,
-                            "variant": "grayscale",
-                            "decoder": ACTIVE_DECODER, "error": None})
+            return jsonify({
+                "isReadable":     True,
+                "barcodeValue":   val,
+                "variant":        "grayscale",
+                "decoder":        ACTIVE_DECODER,
+                "processedImage": img_to_base64(gray),
+                "error":          None
+            })
 
         # ════════════════════════════════════════
         # STEP 3 — direct threshold + morph open + inverted
-        # Exactly your notebook code, threshold sweep around 120
+        # Your exact notebook code, sweeping threshold around 120
         # ════════════════════════════════════════
-        kernel = np.ones((2, 2), np.uint8)
+        kernel     = np.ones((2, 2), np.uint8)
+        last_image = gray  # track last processed image for debugging
 
         for tval in [120, 100, 110, 130, 140, 80, 150, 160, 180, 200, 90]:
 
             # Your exact notebook threshold
-            binary = np.where(gray > tval, 255, 0).astype(np.uint8)
+            binary     = np.where(gray > tval, 255, 0).astype(np.uint8)
+            last_image = binary
 
             val = scan(binary)
             if val:
-                return jsonify({"isReadable": True, "barcodeValue": val,
-                                "variant": f"threshold_{tval}",
-                                "decoder": ACTIVE_DECODER, "error": None})
+                return jsonify({
+                    "isReadable":     True,
+                    "barcodeValue":   val,
+                    "variant":        f"threshold_{tval}",
+                    "decoder":        ACTIVE_DECODER,
+                    "processedImage": img_to_base64(binary),
+                    "error":          None
+                })
 
             # Your exact notebook morph open cleanup
-            cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+            cleaned    = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+            last_image = cleaned
 
             val = scan(cleaned)
             if val:
-                return jsonify({"isReadable": True, "barcodeValue": val,
-                                "variant": f"threshold_{tval}_cleaned",
-                                "decoder": ACTIVE_DECODER, "error": None})
+                return jsonify({
+                    "isReadable":     True,
+                    "barcodeValue":   val,
+                    "variant":        f"threshold_{tval}_cleaned",
+                    "decoder":        ACTIVE_DECODER,
+                    "processedImage": img_to_base64(cleaned),
+                    "error":          None
+                })
 
             # Inverted binary
-            val = scan(cv2.bitwise_not(binary))
+            inv_binary = cv2.bitwise_not(binary)
+            last_image = inv_binary
+
+            val = scan(inv_binary)
             if val:
-                return jsonify({"isReadable": True, "barcodeValue": val,
-                                "variant": f"inv_threshold_{tval}",
-                                "decoder": ACTIVE_DECODER, "error": None})
+                return jsonify({
+                    "isReadable":     True,
+                    "barcodeValue":   val,
+                    "variant":        f"inv_threshold_{tval}",
+                    "decoder":        ACTIVE_DECODER,
+                    "processedImage": img_to_base64(inv_binary),
+                    "error":          None
+                })
 
             # Inverted cleaned
-            val = scan(cv2.bitwise_not(cleaned))
-            if val:
-                return jsonify({"isReadable": True, "barcodeValue": val,
-                                "variant": f"inv_threshold_{tval}_cleaned",
-                                "decoder": ACTIVE_DECODER, "error": None})
+            inv_cleaned = cv2.bitwise_not(cleaned)
+            last_image  = inv_cleaned
 
-        return jsonify({"isReadable": False, "barcodeValue": None,
-                        "variant": None, "decoder": ACTIVE_DECODER,
-                        "error": "Barcode not readable"})
+            val = scan(inv_cleaned)
+            if val:
+                return jsonify({
+                    "isReadable":     True,
+                    "barcodeValue":   val,
+                    "variant":        f"inv_threshold_{tval}_cleaned",
+                    "decoder":        ACTIVE_DECODER,
+                    "processedImage": img_to_base64(inv_cleaned),
+                    "error":          None
+                })
+
+        # Not readable — still return last processed image for debugging
+        return jsonify({
+            "isReadable":     False,
+            "barcodeValue":   None,
+            "variant":        None,
+            "decoder":        ACTIVE_DECODER,
+            "processedImage": img_to_base64(last_image),
+            "error":          "Barcode not readable"
+        })
 
     except Exception as e:
-        return jsonify({"isReadable": False, "barcodeValue": None,
-                        "error": str(e)}), 500
+        return jsonify({
+            "isReadable":     False,
+            "barcodeValue":   None,
+            "processedImage": None,
+            "error":          str(e)
+        }), 500
 
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
-        "status":          "ok",
-        "active_decoder":  ACTIVE_DECODER,
+        "status":           "ok",
+        "active_decoder":   ACTIVE_DECODER,
         "opencv_available": CV2_AVAILABLE,
-        "note": "OpenCV is primary decoder. zxing-cpp is fallback if OpenCV library fails to load."
     })
 
 
