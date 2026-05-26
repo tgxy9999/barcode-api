@@ -127,7 +127,8 @@ def scan_barcode():
         kernel     = np.ones((2, 2), np.uint8)
         last_image = gray  # track last processed image for debugging
 
-        for tval in [120, 100, 110, 130, 140, 80, 150, 160, 180, 200, 90]:
+        # for tval in [120, 100, 110, 130, 140, 80, 150, 160, 180, 200, 90]:
+        tval=120
 
             # Your exact notebook threshold
             binary     = np.where(gray > tval, 255, 0).astype(np.uint8)
