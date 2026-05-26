@@ -30,7 +30,7 @@ def decode_base64_image(b64_string: str) -> np.ndarray:
 
 
 def img_to_base64(img: np.ndarray) -> str:
-    """Convert numpy image array to base64 PNG string for returning to client."""
+    """Convert numpy image to base64 PNG string."""
     _, buf = cv2.imencode('.png', img)
     return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode('utf-8')
 
@@ -44,10 +44,7 @@ def to_pil(img: np.ndarray) -> Image.Image:
 
 
 def scan(img: np.ndarray) -> str | None:
-    """
-    Scan using OpenCV decoder.
-    Falls back to zxing-cpp only if OpenCV library failed to load.
-    """
+    """OpenCV primary, zxing fallback if OpenCV not available."""
     if CV2_AVAILABLE:
         try:
             ret, decoded_list, _, _ = cv2_detector.detectAndDecodeMulti(img)
@@ -66,6 +63,11 @@ def scan(img: np.ndarray) -> str | None:
         except Exception:
             pass
         return None
+
+
+def get_brightness(gray: np.ndarray) -> float:
+    """Get average brightness of image (0=black, 255=white)."""
+    return float(np.mean(gray))
 
 
 @app.route('/scan', methods=['POST', 'OPTIONS'])
@@ -95,14 +97,9 @@ def scan_barcode():
         # ════════════════════════════════════════
         val = scan(img)
         if val:
-            return jsonify({
-                "isReadable":     True,
-                "barcodeValue":   val,
-                "variant":        "original",
-                "decoder":        ACTIVE_DECODER,
-                "processedImage": img_to_base64(img),
-                "error":          None
-            })
+            return jsonify({"isReadable": True, "barcodeValue": val,
+                            "variant": "original", "decoder": ACTIVE_DECODER,
+                            "processedImage": img_to_base64(img), "error": None})
 
         # ════════════════════════════════════════
         # STEP 2 — grayscale
@@ -111,39 +108,46 @@ def scan_barcode():
 
         val = scan(gray)
         if val:
-            return jsonify({
-                "isReadable":     True,
-                "barcodeValue":   val,
-                "variant":        "grayscale",
-                "decoder":        ACTIVE_DECODER,
-                "processedImage": img_to_base64(gray),
-                "error":          None
-            })
+            return jsonify({"isReadable": True, "barcodeValue": val,
+                            "variant": "grayscale", "decoder": ACTIVE_DECODER,
+                            "processedImage": img_to_base64(gray), "error": None})
 
         # ════════════════════════════════════════
-        # STEP 3 — direct threshold + morph open + inverted
-        # Your exact notebook code, sweeping threshold around 120
+        # Detect image brightness
+        # This decides threshold sweep order:
+        # Dark image  → start LOW (30-80) to avoid all-black output
+        # Light image → start at your sweet spot (110-130)
         # ════════════════════════════════════════
-        kernel     = np.ones((2, 2), np.uint8)
-        last_image = gray  # track last processed image for debugging
+        brightness   = get_brightness(gray)
+        is_dark      = brightness < 100   # avg pixel < 100 = dark image
+        kernel       = np.ones((2, 2), np.uint8)
+        last_image   = gray
 
-        # for tval in [120, 100, 110, 130, 140, 80, 150, 160, 180, 200, 90]:
-        tval=120
+        # ── Threshold order based on brightness ──
+        if is_dark:
+            # Dark image: try LOW thresholds first
+            # Low threshold → more pixels become WHITE → clears dark background
+            threshold_order = [40, 50, 60, 70, 30, 80, 90, 100, 110, 120, 130, 140, 150, 160, 180, 200, 20]
+        else:
+            # Normal/light image: your sweet spot first (110-130)
+            threshold_order = [120, 110, 130, 100, 140, 80, 150, 160, 180, 200, 90, 60, 40, 30, 20]
 
+        # ════════════════════════════════════════
+        # STEP 3 — direct threshold sweep
+        # Your exact notebook method
+        # ════════════════════════════════════════
+        for tval in threshold_order:
             # Your exact notebook threshold
             binary     = np.where(gray > tval, 255, 0).astype(np.uint8)
             last_image = binary
 
             val = scan(binary)
             if val:
-                return jsonify({
-                    "isReadable":     True,
-                    "barcodeValue":   val,
-                    "variant":        f"threshold_{tval}",
-                    "decoder":        ACTIVE_DECODER,
-                    "processedImage": img_to_base64(binary),
-                    "error":          None
-                })
+                return jsonify({"isReadable": True, "barcodeValue": val,
+                                "variant": f"threshold_{tval}",
+                                "decoder": ACTIVE_DECODER,
+                                "processedImage": img_to_base64(binary),
+                                "error": None})
 
             # Your exact notebook morph open cleanup
             cleaned    = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
@@ -151,62 +155,91 @@ def scan_barcode():
 
             val = scan(cleaned)
             if val:
-                return jsonify({
-                    "isReadable":     True,
-                    "barcodeValue":   val,
-                    "variant":        f"threshold_{tval}_cleaned",
-                    "decoder":        ACTIVE_DECODER,
-                    "processedImage": img_to_base64(cleaned),
-                    "error":          None
-                })
+                return jsonify({"isReadable": True, "barcodeValue": val,
+                                "variant": f"threshold_{tval}_cleaned",
+                                "decoder": ACTIVE_DECODER,
+                                "processedImage": img_to_base64(cleaned),
+                                "error": None})
 
-            # Inverted binary
-            inv_binary = cv2.bitwise_not(binary)
-            last_image = inv_binary
+        # ════════════════════════════════════════
+        # STEP 4 — inverted versions
+        # For reversed barcodes (light bars on dark background)
+        # ════════════════════════════════════════
+        inv_gray = cv2.bitwise_not(gray)
+        inv_brightness = get_brightness(inv_gray)
+
+        # Sweep thresholds on inverted image
+        if inv_brightness < 100:
+            inv_order = [40, 50, 60, 70, 30, 80, 90, 100, 110, 120, 130]
+        else:
+            inv_order = [120, 110, 130, 100, 140, 80, 150, 160, 60, 40]
+
+        for tval in inv_order:
+            # Invert first then threshold
+            inv_binary  = np.where(inv_gray > tval, 255, 0).astype(np.uint8)
+            inv_cleaned = cv2.morphologyEx(inv_binary, cv2.MORPH_OPEN, kernel)
+            last_image  = inv_cleaned
 
             val = scan(inv_binary)
             if val:
-                return jsonify({
-                    "isReadable":     True,
-                    "barcodeValue":   val,
-                    "variant":        f"inv_threshold_{tval}",
-                    "decoder":        ACTIVE_DECODER,
-                    "processedImage": img_to_base64(inv_binary),
-                    "error":          None
-                })
-
-            # Inverted cleaned
-            inv_cleaned = cv2.bitwise_not(cleaned)
-            last_image  = inv_cleaned
+                return jsonify({"isReadable": True, "barcodeValue": val,
+                                "variant": f"inv_threshold_{tval}",
+                                "decoder": ACTIVE_DECODER,
+                                "processedImage": img_to_base64(inv_binary),
+                                "error": None})
 
             val = scan(inv_cleaned)
             if val:
-                return jsonify({
-                    "isReadable":     True,
-                    "barcodeValue":   val,
-                    "variant":        f"inv_threshold_{tval}_cleaned",
-                    "decoder":        ACTIVE_DECODER,
-                    "processedImage": img_to_base64(inv_cleaned),
-                    "error":          None
-                })
+                return jsonify({"isReadable": True, "barcodeValue": val,
+                                "variant": f"inv_threshold_{tval}_cleaned",
+                                "decoder": ACTIVE_DECODER,
+                                "processedImage": img_to_base64(inv_cleaned),
+                                "error": None})
 
-        # Not readable — still return last processed image for debugging
+        # ════════════════════════════════════════
+        # STEP 5 — CLAHE then threshold
+        # Boosts local contrast before thresholding
+        # Helps when background varies across image
+        # ════════════════════════════════════════
+        clahe      = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe_gray = clahe.apply(gray)
+
+        for tval in [120, 110, 130, 100, 140, 80, 60, 40]:
+            binary     = np.where(clahe_gray > tval, 255, 0).astype(np.uint8)
+            cleaned    = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+            last_image = cleaned
+
+            val = scan(binary)
+            if val:
+                return jsonify({"isReadable": True, "barcodeValue": val,
+                                "variant": f"clahe_threshold_{tval}",
+                                "decoder": ACTIVE_DECODER,
+                                "processedImage": img_to_base64(binary),
+                                "error": None})
+
+            val = scan(cleaned)
+            if val:
+                return jsonify({"isReadable": True, "barcodeValue": val,
+                                "variant": f"clahe_threshold_{tval}_cleaned",
+                                "decoder": ACTIVE_DECODER,
+                                "processedImage": img_to_base64(cleaned),
+                                "error": None})
+
+        # Return last processed image for debugging even on failure
         return jsonify({
             "isReadable":     False,
             "barcodeValue":   None,
             "variant":        None,
             "decoder":        ACTIVE_DECODER,
+            "brightness":     round(brightness, 1),
+            "imageType":      "dark" if is_dark else "normal",
             "processedImage": img_to_base64(last_image),
             "error":          "Barcode not readable"
         })
 
     except Exception as e:
-        return jsonify({
-            "isReadable":     False,
-            "barcodeValue":   None,
-            "processedImage": None,
-            "error":          str(e)
-        }), 500
+        return jsonify({"isReadable": False, "barcodeValue": None,
+                        "processedImage": None, "error": str(e)}), 500
 
 
 @app.route('/health', methods=['GET'])
@@ -215,6 +248,7 @@ def health():
         "status":           "ok",
         "active_decoder":   ACTIVE_DECODER,
         "opencv_available": CV2_AVAILABLE,
+        "note":             "Auto-detects dark/light image and adjusts threshold sweep order"
     })
 
 
